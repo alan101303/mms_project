@@ -2,7 +2,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mms_project/main.dart';
 
-import 'fake_sounds.dart';
+import 'fakes.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -98,6 +98,8 @@ void main() {
       expect(kitchen.timerPaused, isFalse);
       expect(kitchen.timerSeconds, 290);
       await kitchen.cancelTimer();
+      // Let the button highlight run out.
+      await tester.pump(const Duration(seconds: 1));
     });
 
     test('undo is not offered right after opening a recipe', () async {
@@ -115,6 +117,8 @@ void main() {
       expect(kitchen.stepIndex, 0);
       expect(kitchen.timerSeconds, 50);
       await kitchen.cancelTimer();
+      // Let the button highlight run out.
+      await tester.pump(const Duration(seconds: 1));
     });
 
     test('undoing a timer start removes the timer', () async {

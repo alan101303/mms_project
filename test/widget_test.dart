@@ -4,7 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mms_project/main.dart';
 import 'package:provider/provider.dart';
 
-import 'fake_sounds.dart';
+import 'fakes.dart';
 
 void main() {
   const ttsChannel = MethodChannel('flutter_tts');

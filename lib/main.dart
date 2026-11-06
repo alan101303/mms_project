@@ -13,10 +13,15 @@ import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'evaluation_log.dart';
+
 void main() {
   runApp(
     ChangeNotifierProvider(
-      create: (_) => KitchenController()..loadRecipes(),
+      create: (_) => KitchenController()
+        ..loadRecipes()
+        ..loadVoiceLog()
+        ..checkMicPermission(),
       child: const KitchenApp(),
     ),
   );
@@ -46,7 +51,46 @@ class KitchenApp extends StatelessWidget {
       ),
       fontFamily: 'Roboto',
     ),
-    home: const KitchenHomePage(),
+    home: const _StartGate(),
+  );
+}
+
+/// Shows the permission screen until the mic is allowed or skipped, and
+/// rechecks when the user returns from the system settings.
+class _StartGate extends StatefulWidget {
+  const _StartGate();
+
+  @override
+  State<_StartGate> createState() => _StartGateState();
+}
+
+class _StartGateState extends State<_StartGate> {
+  late final AppLifecycleListener _lifecycle;
+
+  @override
+  void initState() {
+    super.initState();
+    _lifecycle = AppLifecycleListener(
+      onResume: () {
+        final kitchen = context.read<KitchenController>();
+        if (!(kitchen.micStatus?.isGranted ?? true)) {
+          unawaited(kitchen.checkMicPermission());
+        }
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _lifecycle.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Consumer<KitchenController>(
+    builder: (context, kitchen, _) => kitchen.needsPermissionScreen
+        ? const PermissionPage()
+        : const KitchenHomePage(),
   );
 }
 
@@ -88,11 +132,39 @@ enum _VoiceCommand {
   help,
   previous,
   repeat,
+  hideIngredients,
   ingredients,
   cancelTimer,
+  pauseTimer,
+  resumeTimer,
   timer,
   pause,
   next,
+}
+
+/// Cooking-page buttons that briefly turn green when used by touch or voice.
+enum CookingControl { previous, pause, next, repeat, timer, ingredients, undo }
+
+/// Wraps permission_handler, so tests can replace it.
+class MicPermission {
+  Future<PermissionStatus> status() => Permission.microphone.status;
+
+  Future<PermissionStatus> request() => Permission.microphone.request();
+
+  Future<bool> openSettings() => openAppSettings();
+}
+
+/// A voice input while it is being handled, for the evaluation log.
+class _Utterance {
+  _Utterance(this.startedAt) : lastChangeAt = startedAt;
+
+  final DateTime startedAt;
+  DateTime lastChangeAt;
+  String text = '';
+  double confidence = -1;
+  VoiceOutcome? outcome;
+  String detail = '';
+  int? feedbackMs;
 }
 
 /// Plays the bundled UI sounds and the looping timer alarm.
@@ -161,8 +233,13 @@ class SoundEffects {
 }
 
 class KitchenController extends ChangeNotifier {
-  KitchenController({SoundEffects? sounds})
-    : _sounds = sounds ?? SoundEffects();
+  KitchenController({
+    SoundEffects? sounds,
+    MicPermission? permission,
+    EvaluationStorage? storage,
+  }) : _sounds = sounds ?? SoundEffects(),
+       _permission = permission ?? MicPermission(),
+       _storage = storage ?? EvaluationStorage();
 
   static const homeHint = 'Tippe auf das Mikrofon und nenne ein Rezept.';
   static const _minConfidence = 0.35;
@@ -210,6 +287,15 @@ class KitchenController extends ChangeNotifier {
       'und dann',
     ],
   };
+  static const _closePatterns = [
+    'schließen',
+    'schliessen',
+    'ausblenden',
+    'weg',
+    'verstecken',
+  ];
+  static const _timerPausePatterns = ['pause', 'pausier*', 'anhalten'];
+  static const _timerResumePatterns = ['weiter', 'fortsetzen', 'fortfahren'];
   static const _timerStopPatterns = [
     'stopp*',
     'stop',
@@ -221,16 +307,24 @@ class KitchenController extends ChangeNotifier {
   ];
   static const _helpText =
       'Du kannst sagen: „Weiter“, „Zurück“, „Wiederholen“, „Zutaten“, '
-      '„Timer fünf Minuten“, „Timer stoppen“, „Pause“ oder „Rückgängig“.';
+      '„Timer fünf Minuten“, „Timer pausieren“, „Timer stoppen“, „Pause“ '
+      'oder „Rückgängig“.';
   static const _maxTimer = Duration(hours: 4);
 
   final SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
   final SoundEffects _sounds;
+  final MicPermission _permission;
+  final EvaluationStorage _storage;
   final List<Recipe> recipes = [];
+  final List<VoiceLogEntry> voiceLog = [];
   Timer? _timer;
   Timer? _restartTimer;
   Timer? _alarmTimeout;
+  Timer? _highlightTimer;
+  _Utterance? _utterance;
+  // True while the timer is paused only because „Pause“ paused the guide.
+  bool _timerPausedWithGuide = false;
   Completer<void>? _speechDone;
   Future<void> Function(String text, double confidence)? _resultHandler;
   // Reverts the most recent action; each undoable action sets it.
@@ -255,9 +349,14 @@ class KitchenController extends ChangeNotifier {
   String recognizedText = '';
   String feedback = homeHint;
   String? pendingLabel;
-  String selectedInput = 'Stimme';
+  CookingControl? highlightedControl;
+  // Null until checked at startup.
+  PermissionStatus? micStatus;
+  bool voiceSkipped = false;
 
   Recipe? get recipe => recipes.isEmpty ? null : recipes[_recipeIndex];
+  bool get needsPermissionScreen =>
+      !voiceSkipped && micStatus != null && !micStatus!.isGranted;
   bool get canUndo => _undoAction != null;
   bool get isListening => voiceState == VoiceState.listening;
 
@@ -268,9 +367,101 @@ class KitchenController extends ChangeNotifier {
     VoiceState.idle => handsFree ? 'Gleich wieder bereit …' : 'Mikrofon aus',
   };
 
-  void setInputMode(String mode) {
-    selectedInput = mode;
+  Future<void> checkMicPermission() async {
+    try {
+      micStatus = await _permission.status();
+    } catch (_) {
+      micStatus = PermissionStatus.denied;
+    }
     notifyListeners();
+  }
+
+  Future<void> requestMicPermission() async {
+    try {
+      micStatus = await _permission.request();
+    } catch (_) {
+      micStatus = PermissionStatus.denied;
+    }
+    if (micStatus!.isPermanentlyDenied) {
+      feedback = 'Mikrofonzugriff fehlt. Bitte erlaube ihn in den Einstellungen.';
+    }
+    notifyListeners();
+  }
+
+  Future<void> openMicSettings() async {
+    try {
+      await _permission.openSettings();
+    } catch (_) {
+      // Without a settings app there's nothing more to offer.
+    }
+  }
+
+  /// Uses the app by touch only; the mic can still be allowed later.
+  void skipVoiceSetup() {
+    voiceSkipped = true;
+    notifyListeners();
+  }
+
+  Future<void> loadVoiceLog() async {
+    voiceLog
+      ..clear()
+      ..addAll(await _storage.load());
+    notifyListeners();
+  }
+
+  /// Marks an entry as correctly or wrongly recognized; the same mark again
+  /// removes it.
+  void markLogEntry(VoiceLogEntry entry, bool correct) {
+    entry.correct = entry.correct == correct ? null : correct;
+    notifyListeners();
+    unawaited(_storage.save(voiceLog));
+  }
+
+  void clearVoiceLog() {
+    voiceLog.clear();
+    notifyListeners();
+    unawaited(_storage.save(voiceLog));
+  }
+
+  Future<String?> exportVoiceLog() => _storage.exportCsv(voiceLog);
+
+  /// Plays the confirmation sound for a voice input and records how it was
+  /// handled and how quickly, for the evaluation log.
+  void _confirmInput(UiSound sound, VoiceOutcome outcome, String detail) {
+    unawaited(_sounds.play(sound));
+    final utterance = _utterance;
+    if (utterance == null || utterance.outcome != null) return;
+    utterance
+      ..outcome = outcome
+      ..detail = detail
+      ..feedbackMs = DateTime.now()
+          .difference(utterance.lastChangeAt)
+          .inMilliseconds;
+  }
+
+  void _logUtterance(_Utterance utterance) {
+    final outcome = utterance.outcome;
+    if (outcome == null) return;
+    voiceLog.add(
+      VoiceLogEntry(
+        time: utterance.startedAt,
+        text: utterance.text,
+        confidence: utterance.confidence,
+        outcome: outcome,
+        detail: utterance.detail,
+        feedbackMs: utterance.feedbackMs,
+      ),
+    );
+    unawaited(_storage.save(voiceLog));
+  }
+
+  void _highlight(CookingControl control) {
+    highlightedControl = control;
+    _highlightTimer?.cancel();
+    _highlightTimer = Timer(const Duration(milliseconds: 800), () {
+      highlightedControl = null;
+      notifyListeners();
+    });
   }
 
   Future<void> loadRecipes() async {
@@ -299,7 +490,15 @@ class KitchenController extends ChangeNotifier {
   Future<void> _configureSpeech() async {
     if (_speechInitialized) return;
 
-    final granted = await Permission.microphone.request();
+    PermissionStatus granted;
+    try {
+      granted = await _permission.request();
+    } catch (_) {
+      granted = PermissionStatus.denied;
+    }
+    // Keep the status in sync, without showing the permission screen again.
+    micStatus = granted;
+    voiceSkipped = true;
     if (!granted.isGranted) {
       feedback = granted.isPermanentlyDenied
           ? 'Mikrofonzugriff fehlt. Bitte erlaube ihn in den Einstellungen.'
@@ -360,6 +559,7 @@ class KitchenController extends ChangeNotifier {
   Future<void> _startListening() async {
     if (!handsFree || voiceState != VoiceState.idle) return;
     _heardFeedback = false;
+    _utterance = null;
     voiceState = VoiceState.listening;
     notifyListeners();
     try {
@@ -393,11 +593,19 @@ class KitchenController extends ChangeNotifier {
     }
     if (result.recognizedWords.trim().isEmpty) return;
     recognizedText = result.recognizedWords;
+    final now = DateTime.now();
+    final utterance = _utterance ??= _Utterance(now);
+    if (utterance.text != recognizedText) {
+      utterance
+        ..text = recognizedText
+        ..lastChangeAt = now;
+    }
     if (!_heardFeedback) {
       _heardFeedback = true;
       unawaited(_sounds.play(UiSound.heard));
     }
     if (result.finalResult) {
+      utterance.confidence = result.confidence;
       _restartTimer?.cancel();
       voiceState = VoiceState.processing;
       unawaited(_processResult(recognizedText, result.confidence));
@@ -411,6 +619,9 @@ class KitchenController extends ChangeNotifier {
       await (_resultHandler ?? handleCommand)(text, confidence);
     } finally {
       _handlingCommand = false;
+      final utterance = _utterance;
+      _utterance = null;
+      if (utterance != null) _logUtterance(utterance);
       if (voiceState == VoiceState.processing) voiceState = VoiceState.idle;
       notifyListeners();
       _scheduleRestart();
@@ -472,7 +683,7 @@ class KitchenController extends ChangeNotifier {
     final normalized = text.toLowerCase().trim();
 
     if (confidence > 0 && confidence < _minConfidence) {
-      unawaited(_sounds.play(UiSound.question));
+      _confirmInput(UiSound.question, VoiceOutcome.question, 'Rezeptname');
       feedback =
           'Ich bin nicht sicher. Bitte sage den Rezeptnamen noch einmal.';
       notifyListeners();
@@ -482,14 +693,14 @@ class KitchenController extends ChangeNotifier {
 
     final index = _findRecipeIndex(normalized);
     if (index == null) {
-      unawaited(_sounds.play(UiSound.error));
+      _confirmInput(UiSound.error, VoiceOutcome.notUnderstood, '');
       feedback = 'Ich habe das Rezept nicht erkannt. Sage zum Beispiel „Cremige Tomatenpasta“.';
       notifyListeners();
       await _speak(feedback);
       return false;
     }
 
-    unawaited(_sounds.play(UiSound.success));
+    _confirmInput(UiSound.success, VoiceOutcome.recipe, recipes[index].name);
     openRecipe(index);
     feedback = '${recipes[index].name} ausgewählt.';
     notifyListeners();
@@ -509,6 +720,7 @@ class KitchenController extends ChangeNotifier {
   }
 
   Future<void> undo() async {
+    _highlight(CookingControl.undo);
     final action = _undoAction;
     if (action == null) {
       feedback = 'Es gibt nichts rückgängig zu machen.';
@@ -564,9 +776,10 @@ class KitchenController extends ChangeNotifier {
   }
 
   /// Continues the guide and a timer that „Pause“ stopped together with it.
+  /// A timer paused on its own („Timer pausieren“) stays paused.
   void _resumeGuide() {
     isPaused = false;
-    if (timerPaused) _setTimer(timerSeconds);
+    if (timerPaused && _timerPausedWithGuide) _setTimer(timerSeconds);
   }
 
   Future<void> selectRecipe(int index) async {
@@ -597,6 +810,7 @@ class KitchenController extends ChangeNotifier {
   Future<void> nextStep() async {
     final current = recipe;
     if (current == null) return;
+    _highlight(CookingControl.next);
     if (stepIndex >= current.steps.length - 1) {
       feedback = 'Das war der letzte Schritt. Guten Appetit!';
       notifyListeners();
@@ -612,6 +826,7 @@ class KitchenController extends ChangeNotifier {
   }
 
   Future<void> previousStep() async {
+    _highlight(CookingControl.previous);
     if (stepIndex == 0) {
       feedback = 'Du bist schon beim ersten Schritt.';
       notifyListeners();
@@ -626,6 +841,7 @@ class KitchenController extends ChangeNotifier {
   }
 
   Future<void> repeatStep() async {
+    _highlight(CookingControl.repeat);
     _resumeGuide();
     feedback = 'Ich wiederhole den Schritt.';
     notifyListeners();
@@ -634,6 +850,7 @@ class KitchenController extends ChangeNotifier {
 
   /// „Pause“ stops both the reading and a running timer; „Weiter“ resumes both.
   Future<void> togglePause() async {
+    _highlight(CookingControl.pause);
     final wasPaused = isPaused;
     _undoAction = () => _setPaused(wasPaused);
     await _setPaused(!wasPaused);
@@ -644,6 +861,7 @@ class KitchenController extends ChangeNotifier {
       isPaused = true;
       if (timerSeconds > 0 && !timerPaused) {
         _setTimer(timerSeconds, paused: true);
+        _timerPausedWithGuide = true;
       }
       feedback = timerPaused
           ? 'Anleitung und Timer pausiert.'
@@ -659,8 +877,16 @@ class KitchenController extends ChangeNotifier {
   }
 
   void showIngredients() {
+    _highlight(CookingControl.ingredients);
     ingredientsVisible = true;
     feedback = 'Zutaten für ${recipe?.name ?? 'das Rezept'}';
+    notifyListeners();
+  }
+
+  void hideIngredients() {
+    _highlight(CookingControl.ingredients);
+    ingredientsVisible = false;
+    feedback = 'Zutaten ausgeblendet.';
     notifyListeners();
   }
 
@@ -674,6 +900,7 @@ class KitchenController extends ChangeNotifier {
       return;
     }
     await stopAlarm();
+    _highlight(CookingControl.timer);
     _saveTimerUndo();
     _setTimer(duration.inSeconds);
     feedback = 'Timer auf ${_describeDuration(duration)} gestellt.';
@@ -688,6 +915,7 @@ class KitchenController extends ChangeNotifier {
       await _speak(feedback);
       return;
     }
+    _highlight(CookingControl.timer);
     _saveTimerUndo();
     _setTimer(0);
     feedback = 'Timer gestoppt.';
@@ -695,8 +923,46 @@ class KitchenController extends ChangeNotifier {
     await _speak(feedback);
   }
 
+  Future<void> toggleTimerPause() => timerPaused ? resumeTimer() : pauseTimer();
+
+  /// Pauses only the timer; the guide keeps going.
+  Future<void> pauseTimer() async {
+    if (timerSeconds == 0 || timerPaused) {
+      feedback = timerSeconds == 0
+          ? 'Es läuft gerade kein Timer.'
+          : 'Der Timer ist schon pausiert.';
+      notifyListeners();
+      await _speak(feedback);
+      return;
+    }
+    _highlight(CookingControl.timer);
+    _saveTimerUndo();
+    _setTimer(timerSeconds, paused: true);
+    feedback = 'Timer pausiert bei $formattedTimer.';
+    notifyListeners();
+    await _speak('Timer pausiert.');
+  }
+
+  Future<void> resumeTimer() async {
+    if (!timerPaused) {
+      feedback = timerSeconds == 0
+          ? 'Es läuft gerade kein Timer.'
+          : 'Der Timer läuft bereits.';
+      notifyListeners();
+      await _speak(feedback);
+      return;
+    }
+    _highlight(CookingControl.timer);
+    _saveTimerUndo();
+    _setTimer(timerSeconds);
+    feedback = 'Timer läuft weiter.';
+    notifyListeners();
+    await _speak(feedback);
+  }
+
   void _setTimer(int seconds, {bool paused = false}) {
     _timer?.cancel();
+    _timerPausedWithGuide = false;
     timerSeconds = seconds;
     timerPaused = seconds > 0 && paused;
     if (seconds > 0 && !paused) _startTimerTicker();
@@ -800,16 +1066,18 @@ class KitchenController extends ChangeNotifier {
 
     if (alarmRinging) {
       // Whatever is said while the alarm rings switches it off.
-      unawaited(_sounds.play(UiSound.success));
+      _confirmInput(UiSound.success, VoiceOutcome.command, 'Alarm aus');
       await stopAlarm();
       return;
     }
 
     if (_pendingCommand != null) {
       if (_words(command).any(_yesWords.contains)) {
+        _confirmInput(UiSound.success, VoiceOutcome.answer, 'Ja');
         return answerPending(yes: true);
       }
       if (_words(command).any(_noWords.contains)) {
+        _confirmInput(UiSound.success, VoiceOutcome.answer, 'Nein');
         return answerPending(yes: false);
       }
       // Anything else is treated as a new command.
@@ -839,19 +1107,17 @@ class KitchenController extends ChangeNotifier {
   Future<void> _dispatch(String command, {required bool lowConfidence}) async {
     final type = _detectCommand(command);
     if (type != null) {
-      if (lowConfidence) {
-        return _askToConfirm(command, _commandLabel(type, command));
-      }
-      unawaited(_sounds.play(UiSound.success));
+      final label = _commandLabel(type, command);
+      if (lowConfidence) return _askToConfirm(command, label);
+      _confirmInput(UiSound.success, VoiceOutcome.command, label);
       return _runCommand(type, command);
     }
 
     final recipeIndex = _findRecipeIndex(command);
     if (recipeIndex != null) {
-      if (lowConfidence) {
-        return _askToConfirm(command, recipes[recipeIndex].name);
-      }
-      unawaited(_sounds.play(UiSound.success));
+      final name = recipes[recipeIndex].name;
+      if (lowConfidence) return _askToConfirm(command, name);
+      _confirmInput(UiSound.success, VoiceOutcome.recipe, name);
       return selectRecipe(recipeIndex);
     }
 
@@ -863,7 +1129,7 @@ class KitchenController extends ChangeNotifier {
       }
     }
 
-    unawaited(_sounds.play(UiSound.error));
+    _confirmInput(UiSound.error, VoiceOutcome.notUnderstood, '');
     feedback = 'Das habe ich nicht verstanden. Sag zum Beispiel „Weiter“, '
         '„Timer fünf Minuten“ oder „Hilfe“ für alle Befehle.';
     notifyListeners();
@@ -873,7 +1139,7 @@ class KitchenController extends ChangeNotifier {
   Future<void> _askToConfirm(String command, String label) async {
     _pendingCommand = command;
     pendingLabel = label;
-    unawaited(_sounds.play(UiSound.question));
+    _confirmInput(UiSound.question, VoiceOutcome.question, label);
     feedback = 'Meintest du „$label“? Sag „Ja“ oder „Nein“.';
     notifyListeners();
     await _speak(feedback);
@@ -889,10 +1155,16 @@ class KitchenController extends ChangeNotifier {
     final timerPatterns = _commandPatterns[_VoiceCommand.timer]!;
     if (_mentions(words, timerPatterns)) {
       if (_mentions(words, _timerStopPatterns)) return _VoiceCommand.cancelTimer;
-      // „Timer pausieren“ pauses the guide together with the timer.
-      if (_mentions(words, const ['pause', 'pausier*', 'anhalten'])) {
-        return _VoiceCommand.pause;
+      if (_mentions(words, _timerPausePatterns)) return _VoiceCommand.pauseTimer;
+      // „Timer weiter“ resumes; „Timer weiter auf 5 Minuten“ sets a new time.
+      if (_mentions(words, _timerResumePatterns) &&
+          _parseDuration(command) == null) {
+        return _VoiceCommand.resumeTimer;
       }
+    }
+    if (_mentions(words, _commandPatterns[_VoiceCommand.ingredients]!) &&
+        _mentions(words, _closePatterns)) {
+      return _VoiceCommand.hideIngredients;
     }
     for (final MapEntry(key: type, value: patterns)
         in _commandPatterns.entries) {
@@ -928,7 +1200,10 @@ class KitchenController extends ChangeNotifier {
     _VoiceCommand.previous => 'Zurück',
     _VoiceCommand.repeat => 'Wiederholen',
     _VoiceCommand.ingredients => 'Zutaten',
+    _VoiceCommand.hideIngredients => 'Zutaten schließen',
     _VoiceCommand.cancelTimer => 'Timer stoppen',
+    _VoiceCommand.pauseTimer => 'Timer pausieren',
+    _VoiceCommand.resumeTimer => 'Timer fortsetzen',
     _VoiceCommand.timer => switch (_parseDuration(command)) {
       final duration? => 'Timer ${_describeDuration(duration)}',
       null => 'Timer',
@@ -947,6 +1222,12 @@ class KitchenController extends ChangeNotifier {
         await _speak(feedback);
       case _VoiceCommand.cancelTimer:
         await cancelTimer();
+      case _VoiceCommand.pauseTimer:
+        await pauseTimer();
+      case _VoiceCommand.resumeTimer:
+        await resumeTimer();
+      case _VoiceCommand.hideIngredients:
+        hideIngredients();
       case _VoiceCommand.previous:
         await previousStep();
       case _VoiceCommand.repeat:
@@ -1224,6 +1505,7 @@ class KitchenController extends ChangeNotifier {
     _timer?.cancel();
     _restartTimer?.cancel();
     _alarmTimeout?.cancel();
+    _highlightTimer?.cancel();
     unawaited(_speech.cancel());
     unawaited(_tts.stop());
     _sounds.dispose();
@@ -1272,6 +1554,23 @@ class KitchenHomePage extends StatelessWidget {
                           ),
                         ),
                         const Spacer(),
+                        IconButton(
+                          tooltip: 'Auswertung',
+                          onPressed: () {
+                            unawaited(kitchen.stopVoice());
+                            Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) => const EvaluationPage(),
+                              ),
+                            );
+                          },
+                          icon: const Icon(Icons.analytics_outlined),
+                          color: _green,
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
                         IconButton(
                           tooltip: 'Hilfe und Sprachbefehle',
                           onPressed: () {
@@ -1409,6 +1708,7 @@ class _HomeVoiceCard extends StatelessWidget {
                   height: 1.35,
                 ),
               ),
+              _SettingsLink(kitchen: kitchen),
             ],
           ),
         ),
@@ -1423,6 +1723,23 @@ class _HomeVoiceCard extends StatelessWidget {
       ],
     ),
   );
+}
+
+/// Shortcut to the system settings once the mic was permanently denied.
+class _SettingsLink extends StatelessWidget {
+  const _SettingsLink({required this.kitchen});
+
+  final KitchenController kitchen;
+
+  @override
+  Widget build(BuildContext context) =>
+      (kitchen.micStatus?.isPermanentlyDenied ?? false)
+      ? TextButton.icon(
+          onPressed: kitchen.openMicSettings,
+          icon: const Icon(Icons.settings_outlined, size: 18),
+          label: const Text('Einstellungen öffnen'),
+        )
+      : const SizedBox.shrink();
 }
 
 /// Green while listening, grey otherwise; the icon shows when the app talks.
@@ -1553,7 +1870,8 @@ class SpeechHelpPage extends StatelessWidget {
     (
       Icons.menu_book_rounded,
       'Zutaten',
-      'Zeigt die Zutaten des ausgewählten Rezepts.',
+      'Zeigt die Zutaten des ausgewählten Rezepts. „Zutaten schließen“ '
+          'blendet sie wieder aus.',
     ),
     (
       Icons.timer_outlined,
@@ -1564,7 +1882,8 @@ class SpeechHelpPage extends StatelessWidget {
     (
       Icons.timer_off_outlined,
       'Timer stoppen',
-      'Beendet den laufenden Timer.',
+      'Beendet den laufenden Timer. „Timer pausieren“ hält ihn an, '
+          '„Timer fortsetzen“ lässt ihn weiterlaufen.',
     ),
     (
       Icons.pause_rounded,
@@ -1666,6 +1985,37 @@ class SpeechHelpPage extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
+        const Text(
+          'Mikrofon-Status',
+          style: TextStyle(
+            color: _ink,
+            fontSize: 17,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 10),
+        const _MicStatusRow(
+          color: _micOn,
+          icon: Icons.mic,
+          text: 'Grünes Mikrofon: Die App hört zu.',
+        ),
+        const _MicStatusRow(
+          color: _micOff,
+          icon: Icons.mic_none_rounded,
+          text: 'Graues Mikrofon: Die App hört gerade nicht zu.',
+        ),
+        const _MicStatusRow(
+          color: _micOff,
+          icon: Icons.volume_up_rounded,
+          text: 'Lautsprecher: Die App spricht und hört danach wieder zu.',
+        ),
+        const _MicStatusRow(
+          color: _micOff,
+          icon: Icons.mic_off_rounded,
+          text: 'Durchgestrichen: Sprachsteuerung aus. Tippe auf das Mikrofon, '
+              'um sie einzuschalten.',
+        ),
+        const SizedBox(height: 8),
         Container(
           padding: const EdgeInsets.all(15),
           decoration: BoxDecoration(
@@ -1681,6 +2031,40 @@ class SpeechHelpPage extends StatelessWidget {
               fontSize: 12,
               height: 1.45,
             ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _MicStatusRow extends StatelessWidget {
+  const _MicStatusRow({
+    required this.color,
+    required this.icon,
+    required this.text,
+  });
+
+  final Color color;
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Row(
+      children: [
+        CircleAvatar(
+          radius: 17,
+          backgroundColor: color,
+          foregroundColor: Colors.white,
+          child: Icon(icon, size: 18),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            text,
+            style: const TextStyle(color: _ink, fontSize: 13, height: 1.4),
           ),
         ),
       ],
@@ -1763,6 +2147,25 @@ class _RecipeCookingPageState extends State<RecipeCookingPage> {
                       onPressed: kitchen.canUndo ? kitchen.undo : null,
                       icon: const Icon(Icons.undo_rounded),
                       color: _green,
+                      style: kitchen.highlightedControl == CookingControl.undo
+                          ? IconButton.styleFrom(
+                              backgroundColor: _micOn,
+                              foregroundColor: Colors.white,
+                            )
+                          : null,
+                    ),
+                    IconButton(
+                      tooltip: 'Hilfe und Sprachbefehle',
+                      onPressed: () {
+                        unawaited(kitchen.stopVoice());
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) => const SpeechHelpPage(),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.help_outline_rounded),
+                      color: _green,
                     ),
                   ],
                 ),
@@ -1834,7 +2237,10 @@ class _RecipeCookingPageState extends State<RecipeCookingPage> {
                     ],
                     if (kitchen.ingredientsVisible) ...[
                       const SizedBox(height: 16),
-                      _InlineIngredients(recipe: recipe),
+                      _InlineIngredients(
+                        recipe: recipe,
+                        onClose: kitchen.hideIngredients,
+                      ),
                     ],
                     const SizedBox(height: 26),
                     _CookingControls(kitchen: kitchen),
@@ -1863,32 +2269,42 @@ class _CookingControls extends StatelessWidget {
         icon: Icons.arrow_back_rounded,
         label: 'Vorheriger Schritt',
         onPressed: kitchen.previousStep,
+        highlighted: kitchen.highlightedControl == CookingControl.previous,
       ),
       _IconControl(
         icon: kitchen.isPaused ? Icons.play_arrow_rounded : Icons.stop_rounded,
         label: kitchen.isPaused ? 'Anleitung starten' : 'Anleitung stoppen',
         prominent: true,
         onPressed: kitchen.togglePause,
+        highlighted: kitchen.highlightedControl == CookingControl.pause,
       ),
       _IconControl(
         icon: Icons.arrow_forward_rounded,
         label: 'Nächster Schritt',
         onPressed: kitchen.nextStep,
+        highlighted: kitchen.highlightedControl == CookingControl.next,
       ),
       _IconControl(
         icon: Icons.replay_rounded,
         label: 'Schritt wiederholen',
         onPressed: kitchen.repeatStep,
+        highlighted: kitchen.highlightedControl == CookingControl.repeat,
       ),
       _IconControl(
         icon: Icons.timer_outlined,
         label: 'Timer einstellen',
         onPressed: () => _showTimerDialog(context, kitchen),
+        highlighted: kitchen.highlightedControl == CookingControl.timer,
       ),
       _IconControl(
         icon: Icons.menu_book_rounded,
-        label: 'Zutaten anzeigen',
-        onPressed: kitchen.showIngredients,
+        label: kitchen.ingredientsVisible
+            ? 'Zutaten ausblenden'
+            : 'Zutaten anzeigen',
+        onPressed: kitchen.ingredientsVisible
+            ? kitchen.hideIngredients
+            : kitchen.showIngredients,
+        highlighted: kitchen.highlightedControl == CookingControl.ingredients,
       ),
     ],
   );
@@ -1899,6 +2315,7 @@ class _IconControl extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.onPressed,
+    required this.highlighted,
     this.prominent = false,
   });
 
@@ -1906,6 +2323,9 @@ class _IconControl extends StatelessWidget {
   final String label;
   final VoidCallback onPressed;
   final bool prominent;
+
+  /// Briefly true after the action ran, by touch or by voice.
+  final bool highlighted;
 
   @override
   Widget build(BuildContext context) => Expanded(
@@ -1917,8 +2337,12 @@ class _IconControl extends StatelessWidget {
         icon: Icon(icon),
         iconSize: 21,
         style: IconButton.styleFrom(
-          backgroundColor: prominent ? _green : Colors.white,
-          foregroundColor: prominent ? Colors.white : _ink,
+          backgroundColor: highlighted
+              ? _micOn
+              : prominent
+              ? _green
+              : Colors.white,
+          foregroundColor: highlighted || prominent ? Colors.white : _ink,
           minimumSize: const Size(44, 48),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(15),
@@ -2001,20 +2425,22 @@ class _MicrophoneDock extends StatelessWidget {
             fontWeight: FontWeight.w700,
           ),
         ),
+        _SettingsLink(kitchen: kitchen),
       ],
     ),
   );
 }
 
 class _InlineIngredients extends StatelessWidget {
-  const _InlineIngredients({required this.recipe});
+  const _InlineIngredients({required this.recipe, required this.onClose});
 
   final Recipe recipe;
+  final VoidCallback onClose;
 
   @override
   Widget build(BuildContext context) => Container(
     width: double.infinity,
-    padding: const EdgeInsets.all(18),
+    padding: const EdgeInsets.fromLTRB(18, 8, 8, 18),
     decoration: BoxDecoration(
       color: const Color(0xFFE9EDE3),
       borderRadius: BorderRadius.circular(20),
@@ -2022,15 +2448,26 @@ class _InlineIngredients extends StatelessWidget {
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          'Zutaten für ${recipe.name}',
-          style: const TextStyle(
-            color: _ink,
-            fontSize: 15,
-            fontWeight: FontWeight.w800,
-          ),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Zutaten für ${recipe.name}',
+                style: const TextStyle(
+                  color: _ink,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Zutaten schließen',
+              onPressed: onClose,
+              icon: const Icon(Icons.close_rounded),
+              color: _ink,
+            ),
+          ],
         ),
-        const SizedBox(height: 8),
         ...recipe.ingredients.map(
           (ingredient) => Padding(
             padding: const EdgeInsets.symmetric(vertical: 3),
@@ -2090,7 +2527,7 @@ class _TimerCard extends StatelessWidget {
             ),
             child: const Text('Alarm aus'),
           )
-        else
+        else ...[
           Text(
             kitchen.formattedTimer,
             style: const TextStyle(
@@ -2100,6 +2537,24 @@ class _TimerCard extends StatelessWidget {
               fontWeight: FontWeight.w800,
             ),
           ),
+          const SizedBox(width: 6),
+          IconButton(
+            tooltip: kitchen.timerPaused ? 'Timer fortsetzen' : 'Timer pausieren',
+            onPressed: kitchen.toggleTimerPause,
+            icon: Icon(
+              kitchen.timerPaused
+                  ? Icons.play_arrow_rounded
+                  : Icons.pause_rounded,
+            ),
+            color: _ink,
+          ),
+          IconButton(
+            tooltip: 'Timer stoppen',
+            onPressed: kitchen.cancelTimer,
+            icon: const Icon(Icons.stop_rounded),
+            color: _ink,
+          ),
+        ],
       ],
     ),
   );
@@ -2173,5 +2628,362 @@ class _TimerDialogState extends State<_TimerDialog> {
         icon: const Icon(Icons.play_arrow_rounded),
       ),
     ],
+  );
+}
+
+/// Screen 1 of the proposal: explains the mic before Android asks for it.
+class PermissionPage extends StatelessWidget {
+  const PermissionPage({super.key});
+
+  static const _points = <(IconData, String)>[
+    (
+      Icons.mic,
+      'Das Mikrofon ist nur aktiv, wenn das Mikrofon-Symbol grün ist.',
+    ),
+    (
+      Icons.cloud_outlined,
+      'Die Erkennung nutzt die Spracherkennung deines Geräts und braucht '
+          'meist eine Internetverbindung.',
+    ),
+    (
+      Icons.touch_app_outlined,
+      'Alles lässt sich auch per Touch bedienen.',
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) => Consumer<KitchenController>(
+    builder: (context, kitchen, _) {
+      final denied = kitchen.micStatus?.isPermanentlyDenied ?? false;
+      return Scaffold(
+        body: SafeArea(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
+            children: [
+              const CircleAvatar(
+                radius: 40,
+                backgroundColor: Color(0xFFE7EBDD),
+                foregroundColor: _green,
+                child: Icon(Icons.mic, size: 40),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'Sprachsteuerung erlauben',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: _ink,
+                  fontSize: 26,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Küchenstimme hört auf Befehle wie „Weiter“ oder „Timer fünf '
+                'Minuten“, damit du das Display mit nassen Händen nicht '
+                'berühren musst. Dafür braucht die App Zugriff auf das '
+                'Mikrofon.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: _ink, fontSize: 15, height: 1.5),
+              ),
+              const SizedBox(height: 24),
+              for (final (icon, text) in _points)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Row(
+                    children: [
+                      Icon(icon, color: _green),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          text,
+                          style: const TextStyle(
+                            color: Color(0xFF59645A),
+                            fontSize: 14,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 16),
+              if (denied) ...[
+                const Text(
+                  'Der Mikrofonzugriff wurde abgelehnt. Du kannst ihn in den '
+                  'Einstellungen unter „Berechtigungen“ erlauben.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Color(0xFFB0412E), fontSize: 14),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: kitchen.openMicSettings,
+                  icon: const Icon(Icons.settings_outlined),
+                  label: const Text('Einstellungen öffnen'),
+                ),
+              ] else
+                FilledButton.icon(
+                  onPressed: kitchen.requestMicPermission,
+                  icon: const Icon(Icons.mic),
+                  label: const Text('Mikrofon freigeben'),
+                ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: kitchen.skipVoiceSetup,
+                child: const Text('Ohne Sprache fortfahren'),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+/// AP8: recognition rate and feedback times of the logged voice inputs.
+class EvaluationPage extends StatelessWidget {
+  const EvaluationPage({super.key});
+
+  static String _percent(int part, int whole) =>
+      whole == 0 ? '–' : '${(100 * part / whole).round()} %';
+
+  static String _time(DateTime time) => [
+    time.hour,
+    time.minute,
+    time.second,
+  ].map((part) => part.toString().padLeft(2, '0')).join(':');
+
+  Future<void> _export(BuildContext context, KitchenController kitchen) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final path = await kitchen.exportVoiceLog();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          path == null ? 'Export fehlgeschlagen.' : 'Gespeichert unter $path',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmClear(
+    BuildContext context,
+    KitchenController kitchen,
+  ) async {
+    final clear = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Protokoll löschen?'),
+        content: const Text('Alle aufgezeichneten Spracheingaben gehen verloren.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Abbrechen'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Löschen'),
+          ),
+        ],
+      ),
+    );
+    if (clear ?? false) kitchen.clearVoiceLog();
+  }
+
+  @override
+  Widget build(BuildContext context) => Consumer<KitchenController>(
+    builder: (context, kitchen, _) {
+      final summary = VoiceLogSummary.of(kitchen.voiceLog);
+      final rows = <(String, String)>[
+        ('Spracheingaben', '${summary.total}'),
+        (
+          'Direkt ausgeführt',
+          '${summary.executed} (${_percent(summary.executed, summary.total)})',
+        ),
+        (
+          'Rückfragen',
+          '${summary.questions} (${_percent(summary.questions, summary.total)})',
+        ),
+        (
+          'Nicht verstanden',
+          '${summary.notUnderstood} '
+              '(${_percent(summary.notUnderstood, summary.total)})',
+        ),
+        (
+          'Erkennungsrate (markiert)',
+          '${summary.markedCorrect} von ${summary.marked} '
+              '(${_percent(summary.markedCorrect, summary.marked)})',
+        ),
+        (
+          'Rückmeldung unter 1 s',
+          '${summary.underOneSecond} von ${summary.timed} '
+              '(${_percent(summary.underOneSecond, summary.timed)})',
+        ),
+        (
+          'Rückmeldezeit Median / Max',
+          summary.medianMs == null
+              ? '–'
+              : '${summary.medianMs} ms / ${summary.maxMs} ms',
+        ),
+      ];
+
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Auswertung'),
+          titleTextStyle: const TextStyle(
+            color: _ink,
+            fontSize: 18,
+            fontWeight: FontWeight.w800,
+          ),
+          backgroundColor: _cream,
+        ),
+        body: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 28),
+          children: [
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(17),
+              ),
+              child: Column(
+                children: [
+                  for (final (label, value) in rows)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              label,
+                              style: const TextStyle(
+                                color: Color(0xFF59645A),
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            value,
+                            style: const TextStyle(
+                              color: _ink,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Markiere jede Eingabe als richtig (✓) oder falsch (✗) erkannt, '
+              'um die Erkennungsrate zu berechnen. Die Rückmeldezeit misst '
+              'vom letzten erkannten Wort bis zum Bestätigungston.',
+              style: TextStyle(
+                color: Color(0xFF59645A),
+                fontSize: 12,
+                height: 1.45,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: kitchen.voiceLog.isEmpty
+                        ? null
+                        : () => _export(context, kitchen),
+                    icon: const Icon(Icons.download_rounded),
+                    label: const Text('CSV exportieren'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                OutlinedButton.icon(
+                  onPressed: kitchen.voiceLog.isEmpty
+                      ? null
+                      : () => _confirmClear(context, kitchen),
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  label: const Text('Löschen'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            if (kitchen.voiceLog.isEmpty)
+              const Text(
+                'Noch keine Spracheingaben. Schalte in der Kochansicht das '
+                'Mikrofon ein und sprich Befehle.',
+                style: TextStyle(color: Color(0xFF59645A), fontSize: 13),
+              ),
+            for (final entry in kitchen.voiceLog.reversed)
+              Card(
+                elevation: 0,
+                color: Colors.white,
+                margin: const EdgeInsets.only(bottom: 8),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 8, 4, 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '„${entry.text}“',
+                              style: const TextStyle(
+                                color: _ink,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              [
+                                _time(entry.time),
+                                entry.detail.isEmpty
+                                    ? entry.outcome.label
+                                    : '${entry.outcome.label}: ${entry.detail}',
+                                if (entry.feedbackMs != null)
+                                  '${entry.feedbackMs} ms',
+                                if (entry.confidence >= 0)
+                                  'Konfidenz ${entry.confidence.toStringAsFixed(2)}',
+                              ].join(' · '),
+                              style: const TextStyle(
+                                color: Color(0xFF59645A),
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Richtig erkannt',
+                        onPressed: () => kitchen.markLogEntry(entry, true),
+                        icon: const Icon(Icons.check_rounded),
+                        color: entry.correct == true ? Colors.white : _ink,
+                        style: IconButton.styleFrom(
+                          backgroundColor: entry.correct == true
+                              ? _micOn
+                              : null,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Falsch erkannt',
+                        onPressed: () => kitchen.markLogEntry(entry, false),
+                        icon: const Icon(Icons.close_rounded),
+                        color: entry.correct == false ? Colors.white : _ink,
+                        style: IconButton.styleFrom(
+                          backgroundColor: entry.correct == false
+                              ? const Color(0xFFB0412E)
+                              : null,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+    },
   );
 }

@@ -78,12 +78,24 @@ All items below were fixed on 2026-11-06 and are covered by [test/command_parsin
 
 ## 3. Missing from the proposal
 
-- [ ] **Screen 1, Berechtigung:** explanation and Freigabe button, plus an `openAppSettings` link if permission is permanently denied.
-- [ ] **Timer controls:** pause and cancel, by both touch and voice (goal 3).
-- [ ] **Button highlight:** buttons turn green when activated by touch or voice, as in the sketch. Remove the unused `selectedInput` and `setInputMode` ([main.dart:102](lib/main.dart#L102)).
-- [ ] **Help:** reachable from the cooking page, and with the mic status section from the sketch.
-- [ ] **Ingredients:** make the card closable, or turn it into the separate screen 4 from the proposal.
-- [ ] **Evaluation logging (AP8):** record the recognized text, matched command, confidence and timestamps. Needed to report recognition rate and prove the 1-second goal. Have this ready before evaluation starts on 24.11.
+All items below were added on 2026-11-06 and are covered by [test/proposal_features_test.dart](test/proposal_features_test.dart).
+
+- [x] **Screen 1, Berechtigung:** `PermissionPage` appears at startup while the mic isn't allowed.
+  - It explains why the mic is needed, has a „Mikrofon freigeben" button, „Einstellungen öffnen" after a permanent denial, and „Ohne Sprache fortfahren" for touch only.
+  - The app rechecks the permission when returning from the settings.
+  - The home card and the cooking dock also show „Einstellungen öffnen" while the mic is blocked.
+- [x] **Timer controls:** the timer card has pause/resume and stop buttons, on both the home and cooking screens.
+  - By voice: „Timer pausieren", „Timer fortsetzen", „Timer stoppen".
+  - A timer paused on its own stays paused while cooking continues. „Pause" still pauses the guide and the timer together.
+- [x] **Button highlight:** the button of an action turns green for 0.8 s, whether triggered by touch or voice (`CookingControl`). This covers the six controls and Undo. `selectedInput` and `setInputMode` are removed.
+- [x] **Help:** a help button sits next to Undo on the cooking page. The help page has a „Mikrofon-Status" section (green, grey, speaker, off) and lists the new commands.
+- [x] **Ingredients:** the card has a close button. The Zutaten button toggles, and „Zutaten schließen" / „ausblenden" works by voice. Kept as a card rather than a separate screen 4, so the current step stays visible.
+- [x] **Evaluation logging (AP8):** every voice input is logged with its text, confidence, outcome (Befehl, Rezept, Rückfrage, Antwort, Nicht verstanden) and feedback time.
+  - Feedback time runs from the last change of the recognized words to the confirmation sound.
+  - The log is stored as JSON lines in `Android/data/com.example.mms_project/files/` ([lib/evaluation_log.dart](lib/evaluation_log.dart)).
+  - The „Auswertung" page (chart icon on the home screen) shows the counts, recognition rate, share of feedback under 1 s, and median and max feedback time.
+  - Each entry can be marked ✓/✗. „CSV exportieren" writes `voice_log.csv` for Excel to the same folder.
+  - **[device]** Logging only runs with real speech input, so check on the phone that entries appear and the times look plausible.
 
 ## 4. Could be improved
 
