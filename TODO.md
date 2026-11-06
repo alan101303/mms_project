@@ -9,17 +9,29 @@ Line numbers refer to the review date and will drift.
 
 ## 1. Must fix (blocks the proposal goals)
 
-- [ ] **Add `RecognitionService` to `<queries>`** in [AndroidManifest.xml](android/app/src/main/AndroidManifest.xml). The speech_to_text README requires it and it is missing from the built APK. Speech recognition may fail on Android 11+. Do this first, then test on a phone. **[verified, effect: device]**
-- [ ] **Hands-free listening.** Every command needs a mic tap; `toggleListening` ([main.dart:164](lib/main.dart#L164)) runs once and stops after a 3 s pause. Build a Listening → Processing → Speaking → Listening loop with `awaitSpeakCompletion(true)` so the mic doesn't hear the app. This is also the AP5 state machine, which today is only an `isListening` flag.
-- [ ] **Real timer alarm.** `SystemSoundType.alert` ([main.dart:356](lib/main.dart#L356)) is ignored on Android, so only the spoken sentence plays, once. Ship an alarm sound that repeats until dismissed. **[verified]**
-- [ ] **Reliable confirmation sounds.** `SystemSoundType.click` ([main.dart:188](lib/main.dart#L188)) only plays on the first recognized word and probably depends on Android's touch-sounds setting. There is no sound for "not understood". Use bundled sounds. **[device]**
-- [ ] **Real follow-up question.** [main.dart:384](lib/main.dart#L384) always asks „Meintest du Zurück?", whatever was said, and „ja"/„nein" aren't handled. Recognizers that give no confidence score skip the question entirely. Add fuzzy matching and a pending-confirmation state. **[verified]**
-- [ ] **Make feedback visible.**
-  - The cooking dock ([main.dart:1131](lib/main.dart#L1131)) shows the recognized text instead of `feedback` after a voice command, so follow-up questions and hints never appear.
-  - The dock text is limited to one line.
-  - The home screen never shows `feedback`, so permission and recognition errors are invisible there.
-- [ ] **Fix mic colours.** The help sketch has green = listening and grey = not listening; the app is green when idle and red when listening ([main.dart:1150](lib/main.dart#L1150)).
-- [ ] **Keep the screen on** while cooking, for example with `wakelock_plus`.
+All items below are implemented (2026-11-06) and covered by `flutter test` where possible,
+but **nothing has been tried on a phone yet**. Check the **[device]** notes first.
+
+- [x] **Add `RecognitionService` to `<queries>`** in [AndroidManifest.xml](android/app/src/main/AndroidManifest.xml). **[device]** Confirm the mic works on an Android 11+ phone.
+- [x] **Hands-free listening.** Tapping the mic turns on a Listening → Processing → Speaking → Listening loop (`VoiceState`). It runs until the mic is tapped again or the cooking page closes. The mic is closed while the app speaks.
+  - Uses the TTS completion, cancel and error handlers instead of `awaitSpeakCompletion(true)`. On Android, a stopped utterance never completes an awaited `speak()`, which would freeze the loop.
+  - **[device]** Android's recognizer plays its own start beep on every restart (about every 5–20 s in silence).
+  - **[device]** Every utterance is treated as a command, so nearby conversation triggers „nicht verstanden" replies.
+  - **[device]** Check battery use and whether the beeps are acceptable during a full recipe.
+- [x] **Real timer alarm.** Bundled `assets/sounds/alarm.wav` loops on the alarm audio stream. It stops via „Alarm aus" on the timer card, any voice command, or automatically after 2 minutes. The timer card is now also shown on the home screen.
+- [x] **Reliable confirmation sounds.** Bundled sounds (`audioplayers`):
+  - `heard`: first recognized word
+  - `success`: command understood
+  - `question`: follow-up question
+  - `error`: not understood or recognition failed
+  - **[device]** Check volume, and whether the recognizer mutes them while listening.
+- [x] **Real follow-up question.**
+  - „Meintest du „X"?" names the command that was actually heard, including the minutes for timers.
+  - It's triggered by low confidence or by a near miss (edit distance, e.g. „leiter" → „Weiter").
+  - Answer by voice („ja"/„nein") or with the Ja/Nein buttons in the dock.
+- [x] **Make feedback visible.** The dock and the home voice card now show the recognized text, the feedback (up to 3 lines) and the mic status. Permission and recognition errors are mapped to German messages.
+- [x] **Fix mic colours.** Green while listening, grey otherwise. A speaker icon shows while the app talks, with a status line below the mic.
+- [x] **Keep the screen on** while the cooking page is open (`wakelock_plus`).
 
 ## 2. Bugs
 

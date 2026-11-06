@@ -4,6 +4,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mms_project/main.dart';
 import 'package:provider/provider.dart';
 
+import 'fake_sounds.dart';
+
 void main() {
   const ttsChannel = MethodChannel('flutter_tts');
 
@@ -23,7 +25,9 @@ void main() {
     late KitchenController kitchen;
     await tester.pumpWidget(
       ChangeNotifierProvider(
-        create: (_) => kitchen = KitchenController()..loadRecipes(),
+        create: (_) =>
+            kitchen = KitchenController(sounds: FakeSoundEffects())
+              ..loadRecipes(),
         child: const KitchenApp(),
       ),
     );
@@ -63,6 +67,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('SCHRITT 1'), findsOneWidget);
+    expect(
+      find.text('Sag „Weiter“ oder tippe auf Start, wenn du bereit bist.'),
+      findsOneWidget,
+    );
+    expect(find.text('Mikrofon aus'), findsOneWidget);
     expect(find.byTooltip('Zur Rezeptliste'), findsOneWidget);
     expect(find.byTooltip('Vorheriger Schritt'), findsOneWidget);
     expect(find.byTooltip('Anleitung starten'), findsOneWidget);
@@ -93,5 +102,7 @@ void main() {
     await tester.tap(find.byTooltip('Zur Rezeptliste'));
     await tester.pumpAndSettle();
     expect(find.text('Was kochen wir?'), findsOneWidget);
+    expect(find.text(KitchenController.homeHint), findsOneWidget);
+    expect(find.text('Küchentimer'), findsOneWidget);
   });
 }

@@ -38,6 +38,8 @@ dependencies:
   speech_to_text: ^7.5.0
   flutter_tts: ^4.2.5
   permission_handler: ^13.0.2
+  audioplayers: ^6.8.1
+  wakelock_plus: ^1.8.2
 
 dev_dependencies:
   flutter_test:
@@ -57,6 +59,7 @@ dev_dependencies:
 flutter:
   assets:
     - assets/recipes.json
+    - assets/sounds/
 
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in
