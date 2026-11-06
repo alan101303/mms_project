@@ -77,27 +77,23 @@ class Recipe {
   );
 }
 
-class _KitchenSnapshot {
-  const _KitchenSnapshot({
-    required this.recipeIndex,
-    required this.stepIndex,
-    required this.paused,
-    required this.timerSeconds,
-  });
-
-  final int recipeIndex;
-  final int stepIndex;
-  final bool paused;
-  final int timerSeconds;
-}
-
 /// Where the hands-free voice loop currently is.
 enum VoiceState { idle, listening, processing, speaking }
 
 /// Non-speech sounds that confirm voice input.
 enum UiSound { heard, success, question, error }
 
-enum _VoiceCommand { previous, repeat, ingredients, timer, pause, next }
+enum _VoiceCommand {
+  undo,
+  help,
+  previous,
+  repeat,
+  ingredients,
+  cancelTimer,
+  timer,
+  pause,
+  next,
+}
 
 /// Plays the bundled UI sounds and the looping timer alarm.
 class SoundEffects {
@@ -174,6 +170,7 @@ class KitchenController extends ChangeNotifier {
   static const _noWords = {'nein', 'nee', 'ne', 'nö', 'falsch'};
   static const _fuzzyKeywords = [
     'weiter',
+    'nächster',
     'zurück',
     'wiederholen',
     'nochmal',
@@ -182,7 +179,50 @@ class KitchenController extends ChangeNotifier {
     'pause',
     'stopp',
     'fortsetzen',
+    'rückgängig',
+    'hilfe',
   ];
+  static const _negations = {'nicht', 'kein', 'keine', 'nie'};
+
+  /// Whole words, word stems ending in `*`, or phrases with spaces.
+  /// Checked in this order, so earlier commands win.
+  static const _commandPatterns = <_VoiceCommand, List<String>>{
+    _VoiceCommand.undo: ['rückgängig', 'rueckgaengig', 'undo'],
+    _VoiceCommand.help: ['hilfe', 'befehle', 'was kann ich sagen'],
+    _VoiceCommand.previous: ['zurück', 'zurueck', 'vorher', 'vorherig*'],
+    _VoiceCommand.repeat: [
+      'wiederhol*',
+      'nochmal',
+      'nochmals',
+      'noch einmal',
+      'noch mal',
+    ],
+    _VoiceCommand.ingredients: ['zutat*', 'einkauf*', 'was brauche'],
+    _VoiceCommand.timer: ['timer', 'wecker'],
+    _VoiceCommand.pause: ['pause', 'pausier*', 'stopp*', 'stop', 'anhalten'],
+    _VoiceCommand.next: [
+      'weiter',
+      'fortsetzen',
+      'nächst*',
+      'naechst*',
+      'was kommt danach',
+      'was kommt jetzt',
+      'und dann',
+    ],
+  };
+  static const _timerStopPatterns = [
+    'stopp*',
+    'stop',
+    'abbrechen',
+    'aus',
+    'ausschalten',
+    'löschen',
+    'beenden',
+  ];
+  static const _helpText =
+      'Du kannst sagen: „Weiter“, „Zurück“, „Wiederholen“, „Zutaten“, '
+      '„Timer fünf Minuten“, „Timer stoppen“, „Pause“ oder „Rückgängig“.';
+  static const _maxTimer = Duration(hours: 4);
 
   final SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
@@ -193,7 +233,10 @@ class KitchenController extends ChangeNotifier {
   Timer? _alarmTimeout;
   Completer<void>? _speechDone;
   Future<void> Function(String text, double confidence)? _resultHandler;
-  _KitchenSnapshot? _undoSnapshot;
+  // Reverts the most recent action; each undoable action sets it.
+  Future<void> Function()? _undoAction;
+  // Last step per recipe, so reopening a recipe continues where it was left.
+  final Map<int, int> _progress = {};
   bool _speechInitialized = false;
   bool _ttsConfigured = false;
   bool _heardFeedback = false;
@@ -203,6 +246,7 @@ class KitchenController extends ChangeNotifier {
   int _recipeIndex = 0;
   int stepIndex = 0;
   int timerSeconds = 0;
+  bool timerPaused = false;
   bool handsFree = false;
   bool alarmRinging = false;
   VoiceState voiceState = VoiceState.idle;
@@ -214,7 +258,7 @@ class KitchenController extends ChangeNotifier {
   String selectedInput = 'Stimme';
 
   Recipe? get recipe => recipes.isEmpty ? null : recipes[_recipeIndex];
-  bool get canUndo => _undoSnapshot != null;
+  bool get canUndo => _undoAction != null;
   bool get isListening => voiceState == VoiceState.listening;
 
   String get voiceStatus => switch (voiceState) {
@@ -419,7 +463,7 @@ class KitchenController extends ChangeNotifier {
     'error_language_not_supported' || 'error_language_unavailable' =>
       'Deutsche Spracherkennung ist auf diesem Gerät nicht verfügbar.',
     _ =>
-      'Spracherkennung unterbrochen ($code). '
+      'Die Spracherkennung wurde unterbrochen. '
           'Tippe auf das Mikrofon, um sie neu zu starten.',
   };
 
@@ -456,55 +500,97 @@ class KitchenController extends ChangeNotifier {
   Future<void> announceRecipe() async {
     final current = recipe;
     if (current == null) return;
-    await _speak('${current.name}. Sag „Weiter“, wenn du bereit bist.');
-  }
-
-  void _saveUndo() {
-    _undoSnapshot = _KitchenSnapshot(
-      recipeIndex: _recipeIndex,
-      stepIndex: stepIndex,
-      paused: isPaused,
-      timerSeconds: timerSeconds,
+    final resumeHint = stepIndex > 0
+        ? ' Du warst bei Schritt ${stepIndex + 1}.'
+        : '';
+    await _speak(
+      '${current.name}.$resumeHint Sag „Weiter“, wenn du bereit bist.',
     );
   }
 
   Future<void> undo() async {
-    final snapshot = _undoSnapshot;
-    if (snapshot == null) return;
-    _timer?.cancel();
-    _recipeIndex = snapshot.recipeIndex;
-    stepIndex = snapshot.stepIndex;
-    isPaused = snapshot.paused;
-    timerSeconds = snapshot.timerSeconds;
-    _undoSnapshot = null;
-    if (timerSeconds > 0) _startTimerTicker();
-    feedback = 'Letzte Aktion rückgängig gemacht.';
-    notifyListeners();
-    await _readCurrentStep();
+    final action = _undoAction;
+    if (action == null) {
+      feedback = 'Es gibt nichts rückgängig zu machen.';
+      notifyListeners();
+      await _speak(feedback);
+      return;
+    }
+    _undoAction = null;
+    await action();
+  }
+
+  /// Remembers the recipe and step, so undo can return to them.
+  void _saveStepUndo() {
+    final recipeIndex = _recipeIndex;
+    final step = stepIndex;
+    final paused = isPaused;
+    _undoAction = () async {
+      _recipeIndex = recipeIndex;
+      stepIndex = step;
+      isPaused = paused;
+      feedback = 'Letzte Aktion rückgängig gemacht.';
+      notifyListeners();
+      if (isPaused) {
+        await _tts.stop();
+      } else {
+        await _readCurrentStep();
+      }
+    };
+  }
+
+  /// Remembers the timer, so undo can bring it back. A running timer is
+  /// restored with the time it would have left by now.
+  void _saveTimerUndo() {
+    final seconds = timerSeconds;
+    final paused = timerPaused;
+    final savedAt = DateTime.now();
+    _undoAction = () async {
+      final elapsed = paused ? 0 : DateTime.now().difference(savedAt).inSeconds;
+      _setTimer(max(0, seconds - elapsed), paused: paused);
+      feedback = timerSeconds > 0
+          ? 'Vorheriger Timer wiederhergestellt.'
+          : 'Timer entfernt.';
+      notifyListeners();
+    };
+  }
+
+  /// Switches recipes, keeping each recipe's last step.
+  void _switchRecipe(int index) {
+    _progress[_recipeIndex] = stepIndex;
+    _recipeIndex = index;
+    stepIndex = _progress[index] ?? 0;
+    ingredientsVisible = false;
+  }
+
+  /// Continues the guide and a timer that „Pause“ stopped together with it.
+  void _resumeGuide() {
+    isPaused = false;
+    if (timerPaused) _setTimer(timerSeconds);
   }
 
   Future<void> selectRecipe(int index) async {
     if (index < 0 || index >= recipes.length || index == _recipeIndex) return;
-    _saveUndo();
-    _recipeIndex = index;
-    stepIndex = 0;
-    isPaused = false;
-    ingredientsVisible = false;
-    feedback = 'Rezept ausgewählt.';
+    _saveStepUndo();
+    _switchRecipe(index);
+    _resumeGuide();
+    feedback = '${recipes[index].name} ausgewählt.';
     notifyListeners();
     await _readCurrentStep();
   }
 
   void openRecipe(int index) {
     if (index < 0 || index >= recipes.length) return;
-    _saveUndo();
-    _recipeIndex = index;
-    stepIndex = 0;
+    _switchRecipe(index);
     isPaused = true;
-    ingredientsVisible = false;
+    // A freshly opened recipe has nothing to undo yet.
+    _undoAction = null;
     // From here on, voice input is handled as cooking commands.
     _resultHandler = null;
-    feedback = 'Sag „Weiter“ oder tippe auf Start, wenn du bereit bist.';
+    feedback = stepIndex > 0
+        ? 'Du warst bei Schritt ${stepIndex + 1}. Sag „Weiter“ oder tippe '
+              'auf Start, um dort weiterzumachen.'
+        : 'Sag „Weiter“ oder tippe auf Start, wenn du bereit bist.';
     notifyListeners();
   }
 
@@ -513,13 +599,13 @@ class KitchenController extends ChangeNotifier {
     if (current == null) return;
     if (stepIndex >= current.steps.length - 1) {
       feedback = 'Das war der letzte Schritt. Guten Appetit!';
-      await _speak(feedback);
       notifyListeners();
+      await _speak(feedback);
       return;
     }
-    _saveUndo();
+    _saveStepUndo();
     stepIndex++;
-    isPaused = false;
+    _resumeGuide();
     feedback = 'Schritt ${stepIndex + 1} von ${current.steps.length}';
     notifyListeners();
     await _readCurrentStep();
@@ -531,34 +617,45 @@ class KitchenController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    _saveUndo();
+    _saveStepUndo();
     stepIndex--;
-    isPaused = false;
+    _resumeGuide();
     feedback = 'Schritt ${stepIndex + 1} von ${recipe!.steps.length}';
     notifyListeners();
     await _readCurrentStep();
   }
 
   Future<void> repeatStep() async {
-    isPaused = false;
+    _resumeGuide();
     feedback = 'Ich wiederhole den Schritt.';
     notifyListeners();
     await _readCurrentStep();
   }
 
+  /// „Pause“ stops both the reading and a running timer; „Weiter“ resumes both.
   Future<void> togglePause() async {
-    _saveUndo();
-    isPaused = !isPaused;
-    if (isPaused) {
-      feedback = 'Anleitung pausiert.';
+    final wasPaused = isPaused;
+    _undoAction = () => _setPaused(wasPaused);
+    await _setPaused(!wasPaused);
+  }
+
+  Future<void> _setPaused(bool paused) async {
+    if (paused) {
+      isPaused = true;
+      if (timerSeconds > 0 && !timerPaused) {
+        _setTimer(timerSeconds, paused: true);
+      }
+      feedback = timerPaused
+          ? 'Anleitung und Timer pausiert.'
+          : 'Anleitung pausiert.';
       notifyListeners();
       await _tts.stop();
     } else {
+      _resumeGuide();
       feedback = 'Weiter geht’s.';
       notifyListeners();
       await _readCurrentStep();
     }
-    notifyListeners();
   }
 
   void showIngredients() {
@@ -569,20 +666,40 @@ class KitchenController extends ChangeNotifier {
 
   bool ingredientsVisible = false;
 
-  Future<void> startTimer(int minutes) async {
-    if (minutes < 1 || minutes > 240) {
-      feedback = 'Bitte nenne eine Zeit zwischen 1 und 240 Minuten.';
+  Future<void> startTimer(Duration duration) async {
+    if (duration < const Duration(seconds: 1) || duration > _maxTimer) {
+      feedback = 'Bitte nenne eine Zeit zwischen einer Sekunde und vier Stunden.';
       notifyListeners();
+      await _speak(feedback);
       return;
     }
     await stopAlarm();
-    _saveUndo();
-    _timer?.cancel();
-    timerSeconds = minutes * 60;
-    feedback = 'Timer auf $minutes Minuten gestellt.';
-    _startTimerTicker();
+    _saveTimerUndo();
+    _setTimer(duration.inSeconds);
+    feedback = 'Timer auf ${_describeDuration(duration)} gestellt.';
     notifyListeners();
     await _speak(feedback);
+  }
+
+  Future<void> cancelTimer() async {
+    if (timerSeconds == 0) {
+      feedback = 'Es läuft gerade kein Timer.';
+      notifyListeners();
+      await _speak(feedback);
+      return;
+    }
+    _saveTimerUndo();
+    _setTimer(0);
+    feedback = 'Timer gestoppt.';
+    notifyListeners();
+    await _speak(feedback);
+  }
+
+  void _setTimer(int seconds, {bool paused = false}) {
+    _timer?.cancel();
+    timerSeconds = seconds;
+    timerPaused = seconds > 0 && paused;
+    if (seconds > 0 && !paused) _startTimerTicker();
   }
 
   void _startTimerTicker() {
@@ -747,7 +864,8 @@ class KitchenController extends ChangeNotifier {
     }
 
     unawaited(_sounds.play(UiSound.error));
-    feedback = 'Das habe ich nicht verstanden. Sag zum Beispiel „Weiter“, „Zurück“ oder „Timer fünf Minuten“.';
+    feedback = 'Das habe ich nicht verstanden. Sag zum Beispiel „Weiter“, '
+        '„Timer fünf Minuten“ oder „Hilfe“ für alle Befehle.';
     notifyListeners();
     await _speak(feedback);
   }
@@ -767,39 +885,52 @@ class KitchenController extends ChangeNotifier {
   }
 
   static _VoiceCommand? _detectCommand(String command) {
-    if (command.contains('zurück') ||
-        command.contains('zurueck') ||
-        command.contains('vorher')) {
-      return _VoiceCommand.previous;
+    final words = _words(command).toList();
+    final timerPatterns = _commandPatterns[_VoiceCommand.timer]!;
+    if (_mentions(words, timerPatterns)) {
+      if (_mentions(words, _timerStopPatterns)) return _VoiceCommand.cancelTimer;
+      // „Timer pausieren“ pauses the guide together with the timer.
+      if (_mentions(words, const ['pause', 'pausier*', 'anhalten'])) {
+        return _VoiceCommand.pause;
+      }
     }
-    if (command.contains('wiederhol') ||
-        command.contains('nochmal') ||
-        command.contains('noch einmal')) {
-      return _VoiceCommand.repeat;
-    }
-    if (command.contains('zutat') ||
-        command.contains('einkauf') ||
-        command.contains('was brauche')) {
-      return _VoiceCommand.ingredients;
-    }
-    if (command.contains('timer')) return _VoiceCommand.timer;
-    if (command.contains('pause') ||
-        command.contains('stopp') ||
-        command.contains('stop')) {
-      return _VoiceCommand.pause;
-    }
-    if (command.contains('fortsetzen') || command.contains('weiter')) {
-      return _VoiceCommand.next;
+    for (final MapEntry(key: type, value: patterns)
+        in _commandPatterns.entries) {
+      if (_mentions(words, patterns)) return type;
     }
     return null;
   }
 
+  /// Whether a pattern from [_commandPatterns] occurs as a whole word.
+  /// A negated word („nicht weiter“) doesn't count.
+  static bool _mentions(List<String> words, List<String> patterns) {
+    final text = ' ${words.join(' ')} ';
+    for (final pattern in patterns) {
+      if (pattern.contains(' ')) {
+        if (text.contains(' $pattern ')) return true;
+        continue;
+      }
+      final isStem = pattern.endsWith('*');
+      final key = isStem ? pattern.substring(0, pattern.length - 1) : pattern;
+      for (var i = 0; i < words.length; i++) {
+        final matches = isStem ? words[i].startsWith(key) : words[i] == key;
+        if (matches && (i == 0 || !_negations.contains(words[i - 1]))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   String _commandLabel(_VoiceCommand type, String command) => switch (type) {
+    _VoiceCommand.undo => 'Rückgängig',
+    _VoiceCommand.help => 'Hilfe',
     _VoiceCommand.previous => 'Zurück',
     _VoiceCommand.repeat => 'Wiederholen',
     _VoiceCommand.ingredients => 'Zutaten',
-    _VoiceCommand.timer => switch (_parseMinutes(command)) {
-      final minutes? => 'Timer $minutes Minuten',
+    _VoiceCommand.cancelTimer => 'Timer stoppen',
+    _VoiceCommand.timer => switch (_parseDuration(command)) {
+      final duration? => 'Timer ${_describeDuration(duration)}',
       null => 'Timer',
     },
     _VoiceCommand.pause => 'Pause',
@@ -808,6 +939,14 @@ class KitchenController extends ChangeNotifier {
 
   Future<void> _runCommand(_VoiceCommand type, String command) async {
     switch (type) {
+      case _VoiceCommand.undo:
+        await undo();
+      case _VoiceCommand.help:
+        feedback = _helpText;
+        notifyListeners();
+        await _speak(feedback);
+      case _VoiceCommand.cancelTimer:
+        await cancelTimer();
       case _VoiceCommand.previous:
         await previousStep();
       case _VoiceCommand.repeat:
@@ -819,13 +958,14 @@ class KitchenController extends ChangeNotifier {
           await _speak('Die Zutaten sind: $ingredients.');
         }
       case _VoiceCommand.timer:
-        final minutes = _parseMinutes(command);
-        if (minutes == null) {
-          feedback = 'Wie viele Minuten soll der Timer laufen?';
+        final duration = _parseDuration(command);
+        if (duration == null) {
+          feedback = 'Wie lange soll der Timer laufen? '
+              'Sag zum Beispiel „Timer fünf Minuten“.';
           notifyListeners();
           await _speak(feedback);
         } else {
-          await startTimer(minutes);
+          await startTimer(duration);
         }
       case _VoiceCommand.pause:
         if (!isPaused) await togglePause();
@@ -883,59 +1023,200 @@ class KitchenController extends ChangeNotifier {
     return previous[b.length];
   }
 
+  static const _ordinals = {
+    'eins': 1,
+    'erste': 1,
+    'erstes': 1,
+    'ersten': 1,
+    'zwei': 2,
+    'zweite': 2,
+    'zweites': 2,
+    'zweiten': 2,
+    'drei': 3,
+    'dritte': 3,
+    'drittes': 3,
+    'dritten': 3,
+  };
+
+  /// Finds a recipe by number („Rezept zwei“, „das dritte Rezept“) or by its
+  /// name or part of it („Tomatenpasta“, „Pfannkuchen“).
   int? _findRecipeIndex(String command) {
-    for (var index = 0; index < recipes.length; index++) {
-      final number = switch (index + 1) {
-        1 => 'eins',
-        2 => 'zwei',
-        3 => 'drei',
-        _ => '${index + 1}',
-      };
-      if (command.contains(recipes[index].name.toLowerCase()) ||
-          command.contains('rezept $number') ||
-          command.contains('rezept ${index + 1}')) {
-        return index;
+    final words = _words(command).toList();
+    for (var i = 0; i < words.length; i++) {
+      final number = int.tryParse(words[i]) ?? _ordinals[words[i]];
+      if (number == null || number < 1 || number > recipes.length) continue;
+      final before = i > 0 ? words[i - 1] : '';
+      final after = i + 1 < words.length ? words[i + 1] : '';
+      if (before == 'rezept' || before == 'nummer' || after == 'rezept') {
+        return number - 1;
       }
+    }
+
+    // Score each recipe by how much of the spoken text appears in its name;
+    // short words like „die“ or „ofen“ are too ambiguous to count.
+    int? best;
+    var bestScore = 0;
+    var tied = false;
+    for (var index = 0; index < recipes.length; index++) {
+      final nameWords = _words(recipes[index].name.toLowerCase()).toList();
+      var score = 0;
+      for (final word in words) {
+        if (word.length >= 5 && nameWords.any((name) => name.contains(word))) {
+          score += word.length;
+        }
+      }
+      if (score > bestScore) {
+        best = index;
+        bestScore = score;
+        tied = false;
+      } else if (score > 0 && score == bestScore) {
+        tied = true;
+      }
+    }
+    return tied ? null : best;
+  }
+
+  static const _durationUnits = {
+    'sekunde': 1,
+    'sekunden': 1,
+    'sek': 1,
+    'minute': 60,
+    'minuten': 60,
+    'min': 60,
+    'stunde': 3600,
+    'stunden': 3600,
+    'std': 3600,
+  };
+  static const _halfWords = {'halb', 'halbe', 'halben'};
+  // Articles count as „one“ before a unit („eine Stunde“), but not alone:
+  // „Stell einen Timer“ has no duration.
+  static const _articles = {'ein', 'eine', 'einen', 'einer'};
+  static const _ones = {
+    'ein': 1,
+    'eins': 1,
+    'eine': 1,
+    'einen': 1,
+    'einer': 1,
+    'zwei': 2,
+    'zwo': 2,
+    'drei': 3,
+    'vier': 4,
+    'fünf': 5,
+    'fuenf': 5,
+    'sechs': 6,
+    'sieben': 7,
+    'acht': 8,
+    'neun': 9,
+  };
+  static const _teens = {
+    'zehn': 10,
+    'elf': 11,
+    'zwölf': 12,
+    'zwoelf': 12,
+    'dreizehn': 13,
+    'vierzehn': 14,
+    'fünfzehn': 15,
+    'fuenfzehn': 15,
+    'sechzehn': 16,
+    'siebzehn': 17,
+    'achtzehn': 18,
+    'neunzehn': 19,
+  };
+  static const _tens = {
+    'zwanzig': 20,
+    'dreißig': 30,
+    'dreissig': 30,
+    'vierzig': 40,
+    'fünfzig': 50,
+    'fuenfzig': 50,
+    'sechzig': 60,
+    'siebzig': 70,
+    'achtzig': 80,
+    'neunzig': 90,
+  };
+
+  /// Reads a duration such as „fünf Minuten“, „eine halbe Stunde“,
+  /// „1 Minute 30 Sekunden“, „anderthalb Stunden“ or just „zehn“ (minutes).
+  static Duration? _parseDuration(String command) {
+    final tokens = RegExp(r'\d+(?:[.,]\d+)?|[a-zäöüß]+')
+        .allMatches(command)
+        .map((match) => match.group(0)!)
+        .toList();
+    var seconds = 0.0;
+    var hasUnit = false;
+    double? looseNumber;
+    for (var i = 0; i < tokens.length; i++) {
+      final unit = _durationUnits[tokens[i]];
+      if (unit == null) {
+        if (!_articles.contains(tokens[i])) {
+          looseNumber = _parseNumber(tokens[i]) ?? looseNumber;
+        }
+        continue;
+      }
+      final before = i > 0 ? tokens[i - 1] : '';
+      final amount = _halfWords.contains(before) ? 0.5 : _parseNumber(before);
+      if (amount != null) {
+        seconds += amount * unit;
+        hasUnit = true;
+      }
+    }
+    if (!hasUnit && looseNumber != null) seconds = looseNumber * 60;
+    final total = seconds.round();
+    return total > 0 ? Duration(seconds: total) : null;
+  }
+
+  static double? _parseNumber(String word) {
+    final digits = double.tryParse(word.replaceAll(',', '.'));
+    if (digits != null) return digits;
+    if (word == 'anderthalb') return 1.5;
+    if (word.endsWith('einhalb') && word.length > 'einhalb'.length) {
+      final whole = _parseInteger(word.substring(0, word.length - 7));
+      return whole == null ? null : whole + 0.5;
+    }
+    return _parseInteger(word)?.toDouble();
+  }
+
+  /// German number words up to 999, e.g. „fünfundzwanzig“, „hundertzwanzig“.
+  static int? _parseInteger(String word) {
+    var rest = word;
+    var total = 0;
+    final hundred = rest.indexOf('hundert');
+    if (hundred >= 0) {
+      final prefix = rest.substring(0, hundred);
+      final hundreds = prefix.isEmpty ? 1 : _ones[prefix];
+      if (hundreds == null) return null;
+      total = hundreds * 100;
+      rest = rest.substring(hundred + 'hundert'.length);
+      if (rest.startsWith('und')) rest = rest.substring(3);
+      if (rest.isEmpty) return total;
+    }
+    final direct = _ones[rest] ?? _teens[rest] ?? _tens[rest];
+    if (direct != null) return total + direct;
+    final und = rest.indexOf('und');
+    if (und > 0) {
+      final one = _ones[rest.substring(0, und)];
+      final ten = _tens[rest.substring(und + 3)];
+      if (one != null && ten != null) return total + one + ten;
     }
     return null;
   }
 
-  int? _parseMinutes(String command) {
-    final digit = RegExp(r'\d+').firstMatch(command);
-    if (digit != null) return int.tryParse(digit.group(0)!);
-    const numbers = <String, int>{
-      'eine': 1,
-      'einer': 1,
-      'ein': 1,
-      'zwei': 2,
-      'drei': 3,
-      'vier': 4,
-      'fünf': 5,
-      'fuenf': 5,
-      'sechs': 6,
-      'sieben': 7,
-      'acht': 8,
-      'neun': 9,
-      'zehn': 10,
-      'elf': 11,
-      'zwölf': 12,
-      'zwoelf': 12,
-      'fünfzehn': 15,
-      'fuenfzehn': 15,
-      'zwanzig': 20,
-      'dreißig': 30,
-      'dreissig': 30,
-    };
-    for (final entry in numbers.entries) {
-      if (command.contains(entry.key)) return entry.value;
-    }
-    return null;
+  static String _describeDuration(Duration duration) {
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes % 60;
+    final seconds = duration.inSeconds % 60;
+    return [
+      if (hours > 0) '$hours ${hours == 1 ? 'Stunde' : 'Stunden'}',
+      if (minutes > 0) '$minutes ${minutes == 1 ? 'Minute' : 'Minuten'}',
+      if (seconds > 0) '$seconds ${seconds == 1 ? 'Sekunde' : 'Sekunden'}',
+    ].join(' ');
   }
 
   String get formattedTimer {
-    final minutes = (timerSeconds ~/ 60).toString().padLeft(2, '0');
+    final hours = timerSeconds ~/ 3600;
+    final minutes = (timerSeconds ~/ 60 % 60).toString().padLeft(2, '0');
     final seconds = (timerSeconds % 60).toString().padLeft(2, '0');
-    return '$minutes:$seconds';
+    return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
   }
 
   @override
@@ -1255,18 +1536,19 @@ class SpeechHelpPage extends StatelessWidget {
     (
       Icons.restaurant_menu_rounded,
       'Rezept auswählen',
-      'Sage den Rezeptnamen, zum Beispiel „Cremige Tomatenpasta“, oder „Rezept zwei“.',
+      'Sage den Rezeptnamen oder einen Teil davon, zum Beispiel '
+          '„Tomatenpasta“, oder „Rezept zwei“.',
     ),
     (
       Icons.arrow_forward_rounded,
       'Weiter',
-      'Zum nächsten Zubereitungsschritt.',
+      'Zum nächsten Zubereitungsschritt. Auch: „Nächster Schritt“.',
     ),
     (Icons.arrow_back_rounded, 'Zurück', 'Zum vorherigen Zubereitungsschritt.'),
     (
       Icons.replay_rounded,
       'Nochmal',
-      'Liest den aktuellen Schritt erneut vor.',
+      'Liest den aktuellen Schritt erneut vor. Auch: „Wiederholen“.',
     ),
     (
       Icons.menu_book_rounded,
@@ -1276,12 +1558,28 @@ class SpeechHelpPage extends StatelessWidget {
     (
       Icons.timer_outlined,
       'Timer fünf Minuten',
-      'Startet einen Timer. Die Zeit kann zwischen 1 und 240 Minuten liegen.',
+      'Startet einen Timer, auch mit Sekunden oder Stunden, zum Beispiel '
+          '„Timer eine halbe Stunde“. Höchstens vier Stunden.',
+    ),
+    (
+      Icons.timer_off_outlined,
+      'Timer stoppen',
+      'Beendet den laufenden Timer.',
     ),
     (
       Icons.pause_rounded,
       'Pause',
-      'Pausiert die gesprochene Anleitung. Mit „Weiter“ geht es weiter.',
+      'Pausiert die Anleitung und den Timer. Mit „Weiter“ geht es weiter.',
+    ),
+    (
+      Icons.undo_rounded,
+      'Rückgängig',
+      'Macht die letzte Aktion rückgängig.',
+    ),
+    (
+      Icons.help_outline_rounded,
+      'Hilfe',
+      'Liest die wichtigsten Befehle vor.',
     ),
   ];
 
@@ -1772,7 +2070,11 @@ class _TimerCard extends StatelessWidget {
         const SizedBox(width: 11),
         Expanded(
           child: Text(
-            kitchen.alarmRinging ? 'Timer abgelaufen' : 'Küchentimer',
+            kitchen.alarmRinging
+                ? 'Timer abgelaufen'
+                : kitchen.timerPaused
+                ? 'Küchentimer (pausiert)'
+                : 'Küchentimer',
             style: const TextStyle(
               color: _ink,
               fontSize: 13,
@@ -1811,7 +2113,7 @@ Future<void> _showTimerDialog(
     context: context,
     builder: (_) => const _TimerDialog(),
   );
-  if (minutes != null) await kitchen.startTimer(minutes);
+  if (minutes != null) await kitchen.startTimer(Duration(minutes: minutes));
 }
 
 class _TimerDialog extends StatefulWidget {

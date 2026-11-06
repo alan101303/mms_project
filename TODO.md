@@ -35,44 +35,46 @@ but **nothing has been tried on a phone yet**. Check the **[device]** notes firs
 
 ## 2. Bugs
 
+All items below were fixed on 2026-11-06 and are covered by [test/command_parsing_test.dart](test/command_parsing_test.dart).
+
 ### Timer parsing
 
-`_parseMinutes` ([main.dart:459](lib/main.dart#L459)) matches substrings. Replace it with proper German number parsing, including hours and seconds. **[verified]**
+- [x] **Timer parsing.** `_parseDuration` understands German number words up to 999, compounds („fünfundzwanzig"), hours, minutes and seconds, „halbe", „anderthalb", „zweieinhalb", „1,5" and sums („eine Minute und dreißig Sekunden"). A number without a unit counts as minutes. Articles alone („Stell einen Timer") aren't a duration. The maximum is 4 hours.
 
-| Spoken command | Current result |
-| --- | --- |
-| „Timer fünfzehn Minuten" | 5 min |
-| „Timer dreißig Minuten" | 3 min |
-| „Timer vierzig Minuten" | 4 min |
-| „Timer fünfundzwanzig Minuten" | 5 min |
-| „Stelle einen Timer auf fünf Minuten" | 1 min |
-| „Timer einstellen" | starts a 1-minute timer |
-| „Timer eine Stunde" | 1 min |
-| „Timer 30 Sekunden" | 30 min |
-| „Timer stoppen" | asks how many minutes |
+| Spoken command | Before | Now |
+| --- | --- | --- |
+| „Timer fünfzehn Minuten" | 5 min | 15 min |
+| „Timer dreißig Minuten" | 3 min | 30 min |
+| „Timer vierzig Minuten" | 4 min | 40 min |
+| „Timer fünfundzwanzig Minuten" | 5 min | 25 min |
+| „Stelle einen Timer auf fünf Minuten" | 1 min | 5 min |
+| „Timer einstellen" | starts a 1-minute timer | asks how long |
+| „Timer eine Stunde" | 1 min | 1 h |
+| „Timer 30 Sekunden" | 30 min | 30 s |
+| „Timer stoppen" | asks how many minutes | stops the timer |
 
 ### Pause and undo
 
-- [ ] „Pause" doesn't stop the timer, although the help sketch says it should. **[verified]**
-- [ ] Undo is active right after opening a recipe: after opening recipe 3, it jumped to recipe 1 and left it unpaused ([main.dart:264](lib/main.dart#L264)). **[verified]**
-- [ ] Undo rewinds a running timer (50 s back to 200 s in testing). **[verified]**
-- [ ] Undo restores the paused state but still reads the step aloud ([main.dart:235](lib/main.dart#L235)).
+- [x] „Pause" now pauses the timer too, and „Weiter" (or any step command) resumes it. The timer card shows „pausiert".
+- [x] Opening a recipe clears undo.
+- [x] Undo works per action: undoing a step leaves the timer alone. Undoing a timer start or stop restores the previous timer with the time it would have left by now.
+- [x] Undo that restores a paused state stops speech instead of reading the step.
 
 ### Command matching
 
-- [ ] Add missing synonyms: „nächster Schritt", „nächste", „was kommt danach". **[verified]**
-- [ ] Add voice commands „Hilfe" and „Rückgängig". **[verified]**
-- [ ] Match partial recipe names such as „Tomatenpasta" and „Pfannkuchen" ([main.dart:450](lib/main.dart#L450)). **[verified]**
-- [ ] Match whole words, not substrings: „nicht weiter" currently moves to the next step. **[verified]**
+- [x] Synonyms added: „nächster Schritt", „nächste", „was kommt danach", „was kommt jetzt", „und dann", „noch mal", „nochmals".
+- [x] New voice commands: „Hilfe" (reads the commands aloud), „Rückgängig", „Timer stoppen"/„Timer aus". All are listed on the help page.
+- [x] Partial recipe names („Tomatenpasta", „Pfannkuchen", „Ofengemüse") and ordinals („das dritte Rezept") are matched.
+- [x] Commands match whole words or word stems, not substrings, and a preceding „nicht"/„kein" cancels the match.
 
 ### Speech and flow
 
-- [ ] Stop text-to-speech when the mic is tapped, so the app can't hear itself.
-- [ ] Stop reading when leaving the cooking page.
-- [ ] Replace raw error codes such as `error_no_match` ([main.dart:154](lib/main.dart#L154)) with the help text.
-- [ ] After choosing a recipe by voice, respond by voice. „Tippe auf Start" ([main.dart:269](lib/main.dart#L269)) asks for touch in a hands-free flow.
-- [ ] Don't silently reset progress when reopening a recipe.
-- [ ] Show a running timer on the home screen.
+- [x] Turning the mic on stops text-to-speech (done in section 1).
+- [x] Leaving the cooking page stops reading (done in section 1).
+- [x] Error codes are no longer shown. Silence and no-match just restart listening, and unknown errors show a German message.
+- [x] After choosing a recipe by voice, the app says its name and „Sag Weiter, wenn du bereit bist" (done in section 1).
+- [x] Each recipe remembers its step. Reopening says „Du warst bei Schritt N" on screen and by voice.
+- [x] A running timer is shown on the home screen (done in section 1).
 
 ## 3. Missing from the proposal
 

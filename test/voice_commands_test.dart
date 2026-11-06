@@ -89,7 +89,7 @@ void main() {
   testWidgets('the alarm rings until it is switched off by voice', (
     tester,
   ) async {
-    await kitchen.startTimer(1);
+    await kitchen.startTimer(const Duration(minutes: 1));
     await tester.pump(const Duration(seconds: 61));
 
     expect(kitchen.alarmRinging, isTrue);
@@ -103,7 +103,7 @@ void main() {
   });
 
   testWidgets('the alarm stops by itself after two minutes', (tester) async {
-    await kitchen.startTimer(1);
+    await kitchen.startTimer(const Duration(minutes: 1));
     await tester.pump(const Duration(seconds: 61));
     expect(kitchen.alarmRinging, isTrue);
 
