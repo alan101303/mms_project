@@ -1,0 +1,67 @@
+[
+  {
+    "name": "Cremige Tomatenpasta",
+    "description": "Ein schneller Feierabendklassiker für zwei Personen.",
+    "duration": 25,
+    "icon": "🍝",
+    "ingredients": [
+      "200 g Pasta",
+      "250 g Kirschtomaten",
+      "1 Knoblauchzehe",
+      "150 ml Sahne",
+      "40 g Parmesan",
+      "Olivenöl, Salz und Pfeffer"
+    ],
+    "steps": [
+      "Setze einen Topf mit reichlich Salzwasser auf und koche die Pasta nach Packungsangabe al dente.",
+      "Halbiere die Kirschtomaten und hacke die Knoblauchzehe fein.",
+      "Erhitze etwas Olivenöl in einer Pfanne und dünste den Knoblauch kurz an. Gib die Tomaten dazu und brate alles fünf Minuten.",
+      "Rühre die Sahne ein und würze die Sauce mit Salz und Pfeffer. Lass sie bei kleiner Hitze drei Minuten köcheln.",
+      "Hebe die Pasta unter die Sauce und serviere sie mit frisch geriebenem Parmesan."
+    ]
+  },
+  {
+    "name": "Buntes Ofengemüse",
+    "description": "Knuspriges Gemüse mit Kräuterdip.",
+    "duration": 35,
+    "icon": "🥕",
+    "ingredients": [
+      "2 Karotten",
+      "1 Zucchini",
+      "1 rote Paprika",
+      "2 EL Olivenöl",
+      "1 TL Paprikapulver",
+      "150 g Joghurt",
+      "Schnittlauch, Salz und Pfeffer"
+    ],
+    "steps": [
+      "Heize den Backofen auf 200 Grad Ober- und Unterhitze vor.",
+      "Wasche das Gemüse und schneide es in mundgerechte Stücke.",
+      "Mische das Gemüse mit Olivenöl, Paprikapulver, Salz und Pfeffer.",
+      "Verteile alles auf einem Blech und röste es etwa 25 Minuten im Ofen.",
+      "Rühre den Joghurt mit gehacktem Schnittlauch an und serviere ihn zum Gemüse."
+    ]
+  },
+  {
+    "name": "Apfelpfannkuchen",
+    "description": "Goldbraun gebacken und mit Zimt verfeinert.",
+    "duration": 30,
+    "icon": "🥞",
+    "ingredients": [
+      "2 Äpfel",
+      "2 Eier",
+      "200 ml Milch",
+      "150 g Mehl",
+      "1 EL Zucker",
+      "1 TL Zimt",
+      "Butter zum Ausbacken"
+    ],
+    "steps": [
+      "Schäle die Äpfel, entferne das Kerngehäuse und schneide sie in dünne Scheiben.",
+      "Verrühre Eier, Milch, Mehl und Zucker zu einem glatten Teig.",
+      "Erhitze etwas Butter in einer Pfanne und gieße eine kleine Kelle Teig hinein.",
+      "Lege Apfelscheiben auf den Teig und backe den Pfannkuchen bei mittlerer Hitze goldbraun.",
+      "Wende den Pfannkuchen vorsichtig, backe die andere Seite fertig und bestreue ihn mit Zimt."
+    ]
+  }
+]
