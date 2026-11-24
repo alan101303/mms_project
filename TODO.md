@@ -7,6 +7,15 @@ Tags: **[verified]** = reproduced by running the code or checked against SDK/plu
 **[device]** = needs checking or measuring on a phone. Untagged items come from reading the code.
 Line numbers refer to the review date and will drift.
 
+## 0. First phone test (2026-11-24, Samsung Galaxy S24, Android 15, Speech Services by Google)
+
+- [x] **Voice commands were never executed** **[verified]**. The words appeared on screen and the `heard` sound played, but nothing else happened.
+  - Cause: this recognizer sends the words only as partial results. After `stopListening()` its final result is empty, and the plugin reports `done` before it. The app treated that as silence and restarted the mic after 300 ms, which also cancelled the plugin's 2 s fallback that would have sent the last partial as final.
+  - Fix: `_processHeardWords()` runs the last partial result as the command when a session ends with `done` or a no-match/timeout error. A late real final result is dropped because the state is then no longer `listening`, so nothing runs twice.
+  - Checked on the phone: „Apfelpfannkuchen" opens and announces the recipe, and „weiter" goes to step 1. Not covered by `flutter test`, since the controller creates `SpeechToText` itself (see „Code structure" in section 4).
+- [x] **Confirmation sounds were silent in silent/vibrate mode** **[verified]**. `assistanceSonification` plays on the system stream, which is muted then. They now use the media stream, like the spoken replies.
+- [x] Mic, German recognition and TTS work on Android 15 (answers the `<queries>` item below).
+
 ## 1. Must fix (blocks the proposal goals)
 
 All items below are implemented (2026-11-06) and covered by `flutter test` where possible,

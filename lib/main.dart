@@ -174,8 +174,10 @@ class SoundEffects {
 
   Future<void> play(UiSound sound) async {
     try {
+      // Media usage, like the spoken replies: the system/notification streams
+      // that assistanceSonification maps to are muted in silent/vibrate mode.
       final player = _effects ??= await _createPlayer(
-        AndroidUsageType.assistanceSonification,
+        AndroidUsageType.media,
         AndroidAudioFocus.none,
       );
       await player.stop();
@@ -629,13 +631,32 @@ class KitchenController extends ChangeNotifier {
   }
 
   void _onSpeechStatus(String status) {
-    // A session that ends without a final result (silence) starts over.
-    if (status == SpeechToText.doneStatus &&
-        voiceState == VoiceState.listening) {
-      voiceState = VoiceState.idle;
-      notifyListeners();
-      _scheduleRestart();
+    if (status != SpeechToText.doneStatus ||
+        voiceState != VoiceState.listening) {
+      return;
     }
+    if (_processHeardWords()) return;
+    // A session that ends without any words (silence) starts over.
+    voiceState = VoiceState.idle;
+    notifyListeners();
+    _scheduleRestart();
+  }
+
+  /// Handles the session's last partial result as the command.
+  ///
+  /// Some recognizers (Google's on Android 13+, e.g. on Samsung phones) send
+  /// the words only as partial results and end with an empty final result,
+  /// reporting „done" before it. Without this, the words would be dropped and
+  /// the mic would simply restart. Returns whether there was anything to run.
+  bool _processHeardWords() {
+    final text = _utterance?.text.trim() ?? '';
+    if (text.isEmpty) return false;
+    _restartTimer?.cancel();
+    voiceState = VoiceState.processing;
+    notifyListeners();
+    // Partial results carry no usable confidence.
+    unawaited(_processResult(text, -1));
+    return true;
   }
 
   void _onSpeechError(SpeechRecognitionError error) {
@@ -648,6 +669,10 @@ class KitchenController extends ChangeNotifier {
           'error_speech_timeout' ||
           'error_client' ||
           'error_busy':
+        // Words already heard still count, even if the final result failed.
+        if (voiceState == VoiceState.listening && _processHeardWords()) {
+          return;
+        }
         // Silence or a busy recognizer: just listen again.
         voiceState = VoiceState.idle;
         notifyListeners();
